@@ -1,471 +1,729 @@
 #!/usr/bin/env python3
 """
-build_dashboard.py  —  Wardrobe OS front-end generator.
+build_dashboard.py  —  The Dressing Room
 
-Reads the live Notion Wardrobe OS (Closet, Outfits, Capsules, Recommendations,
-Inspiration) and writes a single self-contained `wardrobe.html` you open locally.
-Item images load from a sibling `images/` folder, matched by the IMG_####/slug key.
+Reads the Wardrobe OS Notion databases (Closet, Outfits, Capsules) and generates
+a static, photographic, rateable wardrobe dashboard for GitHub Pages.
 
-  pip install requests
-  export NOTION_TOKEN=ntn_xxx
-  python3 build_dashboard.py                # full build from Notion -> wardrobe.html
-  python3 build_dashboard.py --preview DIR  # demo build from local thumbnails in DIR
+Source of truth is Notion. This script:
+  - pulls every Closet item, Outfit (look), and Capsule via the Notion REST API
+  - downloads each piece photo LOCALLY so Notion's signed URLs can't expire
+    between hourly rebuilds (the thing that silently breaks a naive build)
+  - groups looks by capsule, then by formality (Beach / Casual / Smart / Dressy)
+  - renders each look photographically: the piece thumbnails, the slot list,
+    a styling note, and the "wear with" accessories
+  - adds the in-tool feedback loop: Top / Solid / Maybe / Cut + a note per look,
+    saved in the browser, with an Export button that produces text to paste back
+  - builds a categorized, checkbox packing list per capsule
 
-Put your finished photos in an `images/` folder next to wardrobe.html (filenames
-= the key in each item's Notes, e.g. IMG_0523.jpg, bylt_henley_navy.jpg).
+Stdlib only — no pip install, so nothing to break in CI.
+
+Environment:
+  NOTION_TOKEN   Notion internal integration token (set as a GitHub Actions secret).
+                 The integration must be shared with the Closet, Outfits, and
+                 Capsules databases.
+
+Output (default ./dist, override with OUTPUT_DIR env or argv[1]):
+  dist/index.html
+  dist/images/...          downloaded piece photos
+
+The GitHub Pages deploy must publish whatever OUTPUT_DIR resolves to.
 """
-import os, sys, re, json, base64, glob, time
-try:
-    import requests
-except ImportError:
-    requests = None
 
-API   = "https://api.notion.com/v1"
-VER   = "2025-09-03"
-TOKEN = os.environ.get("NOTION_TOKEN")
+import os
+import sys
+import json
+import html
+import time
+import pathlib
+import mimetypes
+import urllib.request
+import urllib.error
 
-SRC = {  # data_source_id, database_id (fallback)
-    "closet":  ("79f58a2a-2767-48b4-9eba-0cef6140ac15", "17624a6894294359a39d9e6fadd600ff"),
-    "outfits": ("5af185ef-9fac-4f98-80fc-7d00955de606", "bd8d2b67dba34149ad8c35b38b5c53a8"),
-    "capsules":("fb3a25cd-ae3c-4ebf-8a82-a6175443b24d", "92ce74f2cb184116bf8ffd7cab490a98"),
-    "recs":    ("4901c849-db7d-4ecd-b24d-5eef73ce0bee", "2b7a811906554b578fdc6d87f00e871f"),
-    "insp":    ("584f6fb8-4c1e-4c5c-9a86-cf98e969eae6", "5a65f884477a4efca8b879a8f009f8e0"),
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
+NOTION_VERSION = "2022-06-28"
+API = "https://api.notion.com/v1"
+
+# Wardrobe OS database IDs
+DB_CLOSET = "17624a68-9429-4359-a39d-9e6fadd600ff"
+DB_OUTFITS = "bd8d2b67-dba3-4149-ad8c-35b38b5c53a8"
+DB_CAPSULES = "92ce74f2-cb18-4116-bf8f-fd7cab490a98"
+
+OUT_DIR = pathlib.Path(
+    (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("OUTPUT_DIR", "dist")).strip()
+)
+IMG_DIR = OUT_DIR / "images"
+
+# Category -> layout slot
+TOP_CATS = {"Shirt", "Polo", "Knitwear", "Tee", "Outerwear", "Swim"}
+BOTTOM_CATS = {"Trousers", "Shorts", "Tailoring"}
+SHOE_CATS = {"Footwear"}
+ACC_CATS = {"Accessory"}
+
+# Formality order + display labels (matches the original dashboard)
+FORMALITY_ORDER = ["Beach", "Casual", "Smart", "Dressy"]
+FORMALITY_LABEL = {
+    "Beach": "Beach \u00b7 Pool",
+    "Casual": "Casual",
+    "Smart": "Smart Casual",
+    "Dressy": "Laid-Back Dressy",
 }
 
-# preserved Italy items -> their product-shot slug filename (no extension)
-TITLE_TO_SLUG = {
-    "Black BYLT Tee": "bylt_dc_black", "Bone BYLT Tee": "bylt_tee_bone",
-    "Navy BYLT Henley": "bylt_henley_navy", "Bone BYLT Henley": "bylt_henley_bone",
-    "Onia Navy Stripe SS": "new_onia_stripe", "Reiss Pink Stripe Linen LS": "real_reiss_stripe",
-    "Bear Bottom Stone": "bearbottom_stone", "Bear Bottom Navy": "bearbottom_navy",
-    "Bear Bottom Deep Mauve": "bearbottom_mauve", "Sand 5-Pocket Pants": "real_sand_pants",
-    "AE Pull-On Trekker Tan": "new_ae_trekker", "Pink/Mauve 5-Pocket": "real_pink_pants",
-    "Maamgic Black/Yellow": "maamgic_blackyellow", "Maamgic Blue/Grey": "maamgic_bluegrey",
-    "Maamgic Navy/Red": "maamgic_navyred", "CT Tan Leather Belt": "belt_tan_leather",
-    "Nisolo Woven Tobacco Belt": "belt_woven_tobacco", "Olive D-Ring Belt": "belt_olive_dring",
-    "J.Crew Stripe Canvas Belt": "belt_stripe", "Quince Brixton Honey/Green": "sunglasses_honey_green",
-    "Le Specs Bandwagon Tort": "sunglasses_lespecs_tort", "Ray-Ban RB4387": "sunglasses_rayban_grey",
-}
-IMG_RE = re.compile(r"IMG_\d+(?:-\d+)?")
+# --------------------------------------------------------------------------- #
+# Notion API
+# --------------------------------------------------------------------------- #
 
-# ---------- Notion helpers ----------
-def H():  return {"Authorization": f"Bearer {TOKEN}", "Notion-Version": VER, "Content-Type": "application/json"}
-def title(p): return "".join(t.get("plain_text","") for t in p.get("title", [])) if p else ""
-def rich(p):  return "".join(t.get("plain_text","") for t in p.get("rich_text", [])) if p else ""
-def sel(p):   return (p.get("select") or {}).get("name","") if p else ""
-def msel(p):  return [o["name"] for o in p.get("multi_select", [])] if p else []
-def relids(p):return [r["id"] for r in p.get("relation", [])] if p else []
 
-def query(name):
-    ds, db = SRC[name]
-    out, cur = [], None
+def _api_post(path, body):
+    req = urllib.request.Request(
+        API + path,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + NOTION_TOKEN,
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        raise SystemExit(
+            "Notion API error on POST %s (%s):\n%s" % (path, e.code, detail)
+        )
+
+
+def notion_query(db_id):
+    """Return every page in a database, following pagination."""
+    out, payload = [], {"page_size": 100}
     while True:
-        body = {"page_size": 100}
-        if cur: body["start_cursor"] = cur
-        r = requests.post(f"{API}/data_sources/{ds}/query", headers=H(), json=body)
-        if r.status_code >= 400:
-            h = {**H(), "Notion-Version": "2022-06-28"}
-            r = requests.post(f"{API}/databases/{db}/query", headers=h, json=body)
-        r.raise_for_status(); j = r.json()
-        out += j["results"]; cur = j.get("next_cursor")
-        if not j.get("has_more"): break
-        time.sleep(0.2)
-    return out
+        data = _api_post("/databases/%s/query" % db_id, payload)
+        out.extend(data.get("results", []))
+        if data.get("has_more"):
+            payload["start_cursor"] = data["next_cursor"]
+        else:
+            return out
 
-def img_key(item_title, notes):
-    m = IMG_RE.search(notes or "")
-    if m: return m.group(0)
-    return TITLE_TO_SLUG.get(item_title, "")
 
-def load_from_notion():
-    closet_raw = query("closet")
-    id2name = {p["id"]: title(p["properties"].get("Item", {})) for p in closet_raw}
-    def photo_name(P):
-        files = (P.get("Photo", {}) or {}).get("files", [])
-        return files[0].get("name", "") if files else ""
-    items = []
-    for p in closet_raw:
-        P = p["properties"]; nm = title(P.get("Item", {}))
-        fn = photo_name(P); details = rich(P.get("Image Details", {}))
-        key = os.path.splitext(fn)[0] if fn else img_key(nm, details)
-        items.append({
-            "id": p["id"], "name": nm, "brand": rich(P.get("Brand", {})),
-            "cat": sel(P.get("Category", {})), "status": sel(P.get("Status", {})),
-            "form": sel(P.get("Formality", {})), "fit": sel(P.get("Fit", {})),
-            "colors": msel(P.get("Color", {})), "material": rich(P.get("Material", {})),
-            "season": msel(P.get("Season", {})), "vibe": msel(P.get("Vibe", {})),
-            "product": rich(P.get("Product", {})),
-            "notes": "", "key": key, "img": fn,
-        })
-    items.sort(key=lambda x: (x["cat"], x["name"]))
-    def safe(name, fn):
-        try: return fn(query(name))
-        except Exception as e: print(f"  ({name} skipped: {e})"); return []
-    looks = safe("outfits", lambda raw: [{
-        "name": title(p["properties"].get("Look", {})),
-        "items": [id2name.get(i,"") for i in relids(p["properties"].get("Items", {}))],
-        "occasion": msel(p["properties"].get("Occasion", {})),
-        "form": sel(p["properties"].get("Formality", {})),
-        "rating": sel(p["properties"].get("Rating", {})),
-        "status": sel(p["properties"].get("Status", {})),
-        "notes": rich(p["properties"].get("Notes", {})),
-    } for p in raw])
-    capsules = safe("capsules", lambda raw: [{
-        "name": title(p["properties"].get("Capsule", {})),
-        "type": sel(p["properties"].get("Type", {})),
-        "items": [id2name.get(i,"") for i in relids(p["properties"].get("Items", {}))],
-        "notes": rich(p["properties"].get("Notes", {})),
-    } for p in raw])
-    recs = safe("recs", lambda raw: [{
-        "name": title(p["properties"].get("Item", {})),
-        "brand": rich(p["properties"].get("Brand", {})),
-        "price": (p["properties"].get("Price", {}) or {}).get("number"),
-        "link": (p["properties"].get("Link", {}) or {}).get("url"),
-        "rationale": rich(p["properties"].get("Rationale", {})),
-        "status": sel(p["properties"].get("Status", {})),
-        "priority": sel(p["properties"].get("Priority", {})),
-    } for p in raw])
-    return items, looks, capsules, recs
+# ---- property extractors -------------------------------------------------- #
 
-# ---------- HTML ----------
-CSS = """
+
+def p_title(props, name):
+    return "".join(t.get("plain_text", "") for t in props.get(name, {}).get("title", [])).strip()
+
+
+def p_text(props, name):
+    return "".join(
+        t.get("plain_text", "") for t in props.get(name, {}).get("rich_text", [])
+    ).strip()
+
+
+def p_select(props, name):
+    s = props.get(name, {}).get("select")
+    return s["name"] if s else None
+
+
+def p_multi(props, name):
+    return [o["name"] for o in props.get(name, {}).get("multi_select", [])]
+
+
+def p_relation(props, name):
+    return [r["id"] for r in props.get(name, {}).get("relation", [])]
+
+
+def p_file_url(props, name):
+    for f in props.get(name, {}).get("files", []):
+        if f.get("type") == "file":
+            return f["file"]["url"]
+        if f.get("type") == "external":
+            return f["external"]["url"]
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Image download (keeps photos from expiring)
+# --------------------------------------------------------------------------- #
+
+
+def download_image(url, stem):
+    """Download to OUT_DIR/images/<stem>.<ext>; return a path relative to index.html.
+    Falls back to the original URL if the download fails."""
+    if not url:
+        return None
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
+    # extension from the URL path, ignoring the query signature
+    path_part = url.split("?", 1)[0]
+    ext = os.path.splitext(path_part)[1].lower().lstrip(".")
+    if ext not in ("jpg", "jpeg", "png", "webp", "gif", "avif"):
+        ext = ""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read()
+            if not ext:
+                ctype = r.headers.get("Content-Type", "")
+                guess = mimetypes.guess_extension((ctype or "").split(";")[0].strip())
+                ext = (guess or ".jpg").lstrip(".")
+        fname = "%s.%s" % (stem, ext)
+        (IMG_DIR / fname).write_bytes(data)
+        return "images/" + fname
+    except Exception as e:  # noqa: BLE001 - want to keep building
+        sys.stderr.write("  ! image download failed (%s): %s\n" % (url[:60], e))
+        return url
+
+
+# --------------------------------------------------------------------------- #
+# Load data
+# --------------------------------------------------------------------------- #
+
+
+def slot_of(cat):
+    if cat in TOP_CATS:
+        return "top"
+    if cat in BOTTOM_CATS:
+        return "bottom"
+    if cat in SHOE_CATS:
+        return "shoes"
+    if cat in ACC_CATS:
+        return "acc"
+    return "acc"
+
+
+def load():
+    print("Loading Closet...")
+    closet = {}
+    for pg in notion_query(DB_CLOSET):
+        pid = pg["id"]
+        props = pg["properties"]
+        url = p_file_url(props, "Photo")
+        closet[pid] = {
+            "name": p_title(props, "Item"),
+            "category": p_select(props, "Category"),
+            "brand": p_text(props, "Brand"),
+            "img": download_image(url, "closet_" + pid.replace("-", "")[:14]),
+        }
+    print("  %d items" % len(closet))
+
+    print("Loading Capsules...")
+    capsules = {}
+    for pg in notion_query(DB_CAPSULES):
+        pid = pg["id"]
+        props = pg["properties"]
+        date = props.get("Dates", {}).get("date") or {}
+        capsules[pid] = {
+            "name": p_title(props, "Capsule"),
+            "notes": p_text(props, "Notes"),
+            "type": p_select(props, "Type"),
+            "start": date.get("start"),
+        }
+    print("  %d capsules" % len(capsules))
+
+    print("Loading Outfits...")
+    outfits = []
+    for pg in notion_query(DB_OUTFITS):
+        props = pg["properties"]
+        caps = p_relation(props, "Capsule")
+        outfits.append(
+            {
+                "id": pg["id"],
+                "name": p_title(props, "Look"),
+                "formality": p_select(props, "Formality"),
+                "capsule": caps[0] if caps else None,
+                "items": p_relation(props, "Items"),
+                "notes": p_text(props, "Notes"),
+                "rating": p_select(props, "Rating"),
+                "occasion": p_multi(props, "Occasion"),
+            }
+        )
+    print("  %d looks" % len(outfits))
+    return closet, capsules, outfits
+
+
+# --------------------------------------------------------------------------- #
+# Render
+# --------------------------------------------------------------------------- #
+
+CSS = r"""
 :root{
-  --paper:#E9E3D7; --card:#F2EEE7; --ink:#211D17; --ink-soft:#6A6253;
-  --line:#D4CCBC; --olive:#5E6646; --navy:#2A3550; --tobacco:#8A6F4E;
-  --marigold:#C08A1E; --rust:#A8542E;
+  --bg:#faf8f3; --ink:#2b2723; --muted:#8c8377; --line:#e7e0d4;
+  --panel:#efe9df; --tile:#fbfaf6; --card:#fffdf9;
+  --top:#5c7a52; --solid:#b08328; --maybe:#9a948b; --cut:#a8493c;
 }
 *{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--paper);color:var(--ink);
-  font-family:Inter,system-ui,-apple-system,sans-serif;font-size:15px;line-height:1.5}
-.mono{font-family:"Spline Sans Mono",ui-monospace,Menlo,monospace}
-.serif{font-family:Fraunces,Georgia,serif}
-a{color:inherit}
-header.top{position:sticky;top:0;z-index:30;background:rgba(233,227,215,.92);
-  backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
-.bar{max-width:1320px;margin:0 auto;padding:14px 22px;display:flex;align-items:baseline;gap:18px;flex-wrap:wrap}
-.brandmark{font-family:Fraunces,serif;font-weight:600;font-size:23px;letter-spacing:.2px}
-.brandmark em{font-style:italic;color:var(--olive)}
-.eyebrow{font-family:"Spline Sans Mono",monospace;font-size:10.5px;letter-spacing:.22em;
-  text-transform:uppercase;color:var(--ink-soft)}
-nav.tabs{margin-left:auto;display:flex;gap:2px}
-nav.tabs button{font-family:"Spline Sans Mono",monospace;font-size:11px;letter-spacing:.12em;
-  text-transform:uppercase;background:none;border:0;color:var(--ink-soft);padding:8px 11px;
-  cursor:pointer;border-bottom:2px solid transparent}
-nav.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--marigold)}
-nav.tabs button:focus-visible{outline:2px solid var(--navy);outline-offset:2px}
-.wrap{max-width:1320px;margin:0 auto;padding:22px}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
+  line-height:1.45;-webkit-font-smoothing:antialiased}
+.serif{font-family:"Hoefler Text","Iowan Old Style",Garamond,Georgia,"Times New Roman",serif}
+.wrap{max-width:880px;margin:0 auto;padding:0 20px 96px}
+header.top{padding:48px 0 8px}
+.eyebrow{font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--muted)}
+h1{font-size:54px;line-height:1;margin:10px 0 6px;font-weight:500}
+.sub{color:var(--muted);font-size:16px;margin:0}
+.stats{display:flex;gap:36px;margin:26px 0 8px}
+.stat .n{font-size:30px;font-weight:600;line-height:1}
+.stat .l{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-top:4px}
 
-/* filter spec bar */
-.spec{display:flex;gap:10px;flex-wrap:wrap;align-items:center;
-  padding:12px 14px;background:var(--card);border:1px solid var(--line);border-radius:3px;margin-bottom:6px}
-.spec input[type=search]{flex:1 1 200px;min-width:160px;border:1px solid var(--line);background:#fff;
-  padding:8px 10px;border-radius:2px;font:inherit}
-.spec select{font-family:"Spline Sans Mono",monospace;font-size:11px;letter-spacing:.06em;
-  text-transform:uppercase;border:1px solid var(--line);background:#fff;padding:7px 8px;border-radius:2px;cursor:pointer}
-.spec .count{font-family:"Spline Sans Mono",monospace;font-size:11px;color:var(--ink-soft);letter-spacing:.08em;margin-left:auto}
-.spec .clear{border:0;background:none;color:var(--ink-soft);cursor:pointer;font:inherit;text-decoration:underline}
+.filters{position:sticky;top:0;z-index:5;background:var(--bg);
+  border-bottom:1px solid var(--line);padding:14px 0;margin-bottom:8px}
+.frow{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:4px 0}
+.frow .lbl{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin-right:6px}
+.chip{border:1px solid var(--line);background:#fff;border-radius:999px;
+  padding:6px 13px;font-size:13px;cursor:pointer;color:var(--ink)}
+.chip.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+.export{margin-left:auto;border:1px solid var(--ink);background:#fff;border-radius:999px;
+  padding:6px 14px;font-size:13px;cursor:pointer}
 
-/* grid */
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(206px,1fr));gap:16px;margin-top:18px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:3px;overflow:hidden;
-  cursor:pointer;transition:transform .14s ease,box-shadow .14s ease;display:flex;flex-direction:column}
-.card:hover{transform:translateY(-3px);box-shadow:0 10px 26px -16px rgba(33,29,23,.5)}
-.card:focus-visible{outline:2px solid var(--navy);outline-offset:2px}
-.thumb{position:relative;aspect-ratio:1/1;background:var(--card);display:flex;align-items:center;justify-content:center;padding:14px}
-.thumb img{max-width:100%;max-height:100%;object-fit:contain}
-.thumb .ph{font-family:"Spline Sans Mono",monospace;font-size:10px;color:var(--ink-soft);text-align:center;padding:0 10px;letter-spacing:.05em}
-.idx{position:absolute;top:8px;left:9px;font-family:"Spline Sans Mono",monospace;font-size:9.5px;
-  color:var(--ink-soft);letter-spacing:.06em}
-.star{position:absolute;top:6px;right:8px;font-size:13px;color:var(--marigold);letter-spacing:-1px}
-.meta{padding:11px 12px 13px;border-top:1px solid var(--line)}
-.meta .nm{font-family:Fraunces,serif;font-size:14.5px;line-height:1.25}
-.meta .br{font-family:"Spline Sans Mono",monospace;font-size:10px;text-transform:uppercase;
-  letter-spacing:.1em;color:var(--ink-soft);margin-top:3px;min-height:12px}
-.chips{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px;align-items:center}
-.chip{font-family:"Spline Sans Mono",monospace;font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;
-  padding:2px 6px;border:1px solid var(--line);border-radius:2px;color:var(--ink-soft)}
-.sw{width:12px;height:12px;border-radius:50%;border:1px solid rgba(0,0,0,.18);display:inline-block}
-.statusdot{margin-left:auto;font-family:"Spline Sans Mono",monospace;font-size:9px;letter-spacing:.08em;
-  text-transform:uppercase;color:var(--ink-soft)}
+.capsule{margin-top:40px}
+.capsule h2{font-size:30px;font-weight:500;margin:0 0 2px}
+.capsule .cmeta{color:var(--muted);font-size:14px;margin:0 0 14px}
+.group-label{font-size:11px;letter-spacing:.2em;text-transform:uppercase;
+  color:var(--muted);margin:26px 0 12px;border-top:1px solid var(--line);padding-top:14px}
 
-/* drawer */
-.scrim{position:fixed;inset:0;background:rgba(33,29,23,.34);opacity:0;pointer-events:none;transition:opacity .2s;z-index:40}
-.scrim.on{opacity:1;pointer-events:auto}
-.drawer{position:fixed;top:0;right:0;height:100%;width:min(430px,92vw);background:var(--paper);
-  border-left:1px solid var(--line);transform:translateX(100%);transition:transform .24s ease;z-index:50;
-  overflow:auto;padding:24px}
-.drawer.on{transform:none}
-.drawer .x{position:absolute;top:16px;right:18px;border:0;background:none;font-size:22px;cursor:pointer;color:var(--ink-soft)}
-.drawer .dimg{background:var(--card);border:1px solid var(--line);border-radius:3px;aspect-ratio:1/1;
-  display:flex;align-items:center;justify-content:center;padding:22px;margin-bottom:18px}
-.drawer .dimg img{max-width:100%;max-height:100%;object-fit:contain}
-.drawer h2{font-family:Fraunces,serif;font-weight:600;font-size:24px;line-height:1.15;margin:0 0 2px}
-.drawer .dbrand{font-family:"Spline Sans Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink-soft);margin-bottom:18px}
-.spec-row{display:grid;grid-template-columns:88px 1fr;gap:8px;padding:9px 0;border-top:1px solid var(--line);font-size:13.5px}
-.spec-row .k{font-family:"Spline Sans Mono",monospace;font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink-soft);padding-top:2px}
-.rate{display:flex;gap:6px;margin:6px 0 2px}
-.rate button{border:1px solid var(--line);background:#fff;font-family:"Spline Sans Mono",monospace;font-size:10px;
-  letter-spacing:.08em;text-transform:uppercase;padding:6px 10px;border-radius:2px;cursor:pointer}
-.rate button[aria-pressed=true]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
-.note{width:100%;border:1px solid var(--line);background:#fff;border-radius:2px;padding:9px;font:inherit;margin-top:8px;resize:vertical;min-height:64px}
+.look{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  overflow:hidden;margin:16px 0}
+.look.cut{opacity:.5}
+.strip{display:flex;gap:2px;background:var(--panel);padding:14px}
+.tile{flex:1;min-width:0;aspect-ratio:1/1;background:var(--tile);border-radius:8px;
+  display:flex;align-items:center;justify-content:center;overflow:hidden}
+.tile img{width:100%;height:100%;object-fit:contain;mix-blend-mode:multiply}
+.tile.empty{color:var(--muted);font-size:11px}
+.body{padding:16px 18px 18px}
+.lhead{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+.lnum{font-size:12px;color:var(--muted)}
+.ltag{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.lname{font-size:24px;font-weight:500;margin:2px 0 12px}
+.slots{font-size:14px;border-top:1px solid var(--line);padding-top:12px}
+.slot{display:flex;gap:10px;margin:3px 0}
+.slot .k{width:62px;color:var(--muted);font-size:11px;letter-spacing:.12em;text-transform:uppercase;padding-top:2px}
+.note{font-style:italic;color:#6f675b;font-size:14px;border-top:1px solid var(--line);
+  margin-top:12px;padding-top:12px}
+.wear{border-top:1px solid var(--line);margin-top:12px;padding-top:12px}
+.wear .wl{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.acc{display:flex;align-items:center;gap:10px;margin:6px 0;font-size:14px}
+.acc .athumb{width:44px;height:44px;border-radius:6px;background:var(--tile);
+  display:flex;align-items:center;justify-content:center;overflow:hidden;flex:0 0 auto}
+.acc .athumb img{width:100%;height:100%;object-fit:contain;mix-blend-mode:multiply}
 
-/* simple tab panels */
-.panel{display:none} .panel.on{display:block}
-.empty{text-align:center;padding:70px 20px;color:var(--ink-soft)}
-.empty h3{font-family:Fraunces,serif;color:var(--ink);font-size:21px;margin:0 0 8px}
-.list{display:flex;flex-direction:column;gap:12px;margin-top:18px}
-.row{background:var(--card);border:1px solid var(--line);border-radius:3px;padding:14px 16px}
-.row .rt{font-family:Fraunces,serif;font-size:17px}
-.row .rs{font-family:"Spline Sans Mono",monospace;font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink-soft);margin-top:3px}
-.reqbtn{font-family:"Spline Sans Mono",monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;
-  border:1px solid var(--ink);background:var(--ink);color:var(--paper);padding:10px 14px;border-radius:2px;cursor:pointer}
-.reqbtn.alt{background:#fff;color:var(--ink)}
-.reqbtn:focus-visible,.reqx:focus-visible{outline:2px solid var(--navy);outline-offset:2px}
-.reqx{border:0;background:none;font-size:20px;line-height:1;color:var(--ink-soft);cursor:pointer;padding:0 4px}
-@media (max-width:640px){ .bar{padding:12px 14px} nav.tabs{width:100%;margin-left:0;overflow-x:auto} .wrap{padding:14px} }
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+.rate{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  border-top:1px solid var(--line);margin-top:14px;padding-top:14px}
+.rbtn{border:1px solid var(--line);background:#fff;border-radius:999px;
+  padding:6px 14px;font-size:13px;cursor:pointer;color:var(--ink)}
+.rbtn[data-r=top].on{background:var(--top);border-color:var(--top);color:#fff}
+.rbtn[data-r=solid].on{background:var(--solid);border-color:var(--solid);color:#fff}
+.rbtn[data-r=maybe].on{background:var(--maybe);border-color:var(--maybe);color:#fff}
+.rbtn[data-r=cut].on{background:var(--cut);border-color:var(--cut);color:#fff}
+.ninput{flex:1;min-width:160px;border:1px solid var(--line);border-radius:10px;
+  padding:7px 11px;font-size:13px;font-family:inherit;background:#fff}
+
+.pack{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:18px;margin-top:18px}
+.pack h3{font-size:16px;margin:0 0 10px;font-weight:600}
+.pack .cat{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:14px 0 6px}
+.pitem{display:flex;align-items:center;gap:10px;font-size:14px;margin:4px 0}
+.pitem input{width:17px;height:17px;accent-color:var(--top)}
+.pitem.done label{color:var(--muted);text-decoration:line-through}
+
+.empty-state{color:var(--muted);text-align:center;padding:60px 0}
+footer{color:var(--muted);font-size:12px;text-align:center;margin-top:48px}
+@media(max-width:560px){h1{font-size:40px}.lname{font-size:21px}.strip{flex-wrap:wrap}.tile{flex-basis:30%}}
+
+.modal{position:fixed;inset:0;background:rgba(20,18,15,.45);display:none;
+  align-items:center;justify-content:center;z-index:20;padding:20px}
+.modal.show{display:flex}
+.modal .box{background:#fff;border-radius:16px;max-width:560px;width:100%;padding:22px}
+.modal h3{margin:0 0 6px}
+.modal p{color:var(--muted);font-size:13px;margin:0 0 12px}
+.modal textarea{width:100%;height:240px;border:1px solid var(--line);border-radius:10px;
+  padding:12px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+.modal button{border:1px solid var(--ink);background:#fff;border-radius:999px;padding:7px 16px;cursor:pointer;font-size:13px}
+.modal button.primary{background:var(--ink);color:#fff}
 """
 
-APP_JS = r"""
-const COLORS={Cream:'#EBE4D4',White:'#FBFAF7',Navy:'#2A3550',Blue:'#5B7A99',Olive:'#5E6646',
-  Tan:'#B79B72',Brown:'#6E4E34',Grey:'#928D82',Black:'#211F1C',Pink:'#C9A6A0',
-  Marigold:'#C08A1E',Rust:'#A8542E'};
-const ITEMS=DATA.items;
-function srcFor(it){ if(MODE==='base64'){return IMG[it.key]||'';} return it.img?('images/'+it.img):(it.key?('images/'+it.key+'.jpg'):''); }
-function ann(id){ try{return JSON.parse(localStorage.getItem('wd:'+id))||{}}catch(e){return{}} }
-function setAnn(id,a){ localStorage.setItem('wd:'+id,JSON.stringify(a)); }
+JS = r"""
+const LS = window.localStorage;
+const rkey = id => "dr:rating:" + id;
+const nkey = id => "dr:note:" + id;
+const pkey = (cap,it) => "dr:pack:" + cap + ":" + it;
 
-function swatch(c){ if(c==='Stripe') return '<span class="sw" style="background:repeating-linear-gradient(45deg,#2A3550 0 3px,#EBE4D4 3px 6px)" title="Stripe"></span>';
-  return '<span class="sw" style="background:'+(COLORS[c]||'#ccc')+'" title="'+c+'"></span>'; }
-
-function cardHTML(it,i){
-  const s=srcFor(it); const a=ann(it.id);
-  const img=s?('<img loading="lazy" src="'+s+'" alt="'+it.name+'" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'block\'">'+
-              '<span class="ph" style="display:none">'+(it.key||it.name)+'<br>(drop image in /images)</span>')
-            :('<span class="ph">'+(it.key||'no key')+'</span>');
-  const sw=(it.colors||[]).map(swatch).join('');
-  return '<button class="card" data-i="'+i+'">'+
-    '<div class="thumb"><span class="idx">'+String(i+1).padStart(3,'0')+'</span>'+
-      (a.rating?'<span class="star" title="'+a.rating+'">'+(a.rating==='Top'?'★★':a.rating==='Solid'?'★':'☆')+'</span>':'')+
-      img+'</div>'+
-    '<div class="meta"><div class="nm">'+it.name+'</div>'+
-      '<div class="br">'+(it.brand||'—')+'</div>'+
-      '<div class="chips">'+(it.cat?'<span class="chip">'+it.cat+'</span>':'')+sw+
-        '<span class="statusdot">'+(it.status||'')+'</span></div>'+
-    '</div></button>';
+function effRating(card){
+  const id = card.dataset.look;
+  return LS.getItem(rkey(id)) || card.dataset.rating || "";
+}
+function paintLook(card){
+  const id = card.dataset.look;
+  const r = LS.getItem(rkey(id)) || "";
+  card.querySelectorAll(".rbtn").forEach(b => b.classList.toggle("on", b.dataset.r === r));
+  card.classList.toggle("cut", r === "cut");
+  const n = card.querySelector(".ninput");
+  if (n) n.value = LS.getItem(nkey(id)) || "";
+}
+function setRating(card, r){
+  const id = card.dataset.look;
+  const cur = LS.getItem(rkey(id)) || "";
+  if (cur === r) LS.removeItem(rkey(id)); else LS.setItem(rkey(id), r);
+  paintLook(card); applyFilters();
 }
 
-let view=[];
+let fFormality = "all", fRating = "all";
 function applyFilters(){
-  const q=(F.q.value||'').toLowerCase();
-  const get=id=>F[id].value;
-  view=ITEMS.filter(it=>{
-    if(q && !(it.name+' '+it.brand+' '+it.material+' '+it.notes).toLowerCase().includes(q)) return false;
-    if(get('cat') && it.cat!==get('cat')) return false;
-    if(get('status') && it.status!==get('status')) return false;
-    if(get('form') && it.form!==get('form')) return false;
-    if(get('color') && !(it.colors||[]).includes(get('color'))) return false;
-    if(get('season') && !(it.season||[]).includes(get('season'))) return false;
-    if(get('vibe') && !(it.vibe||[]).includes(get('vibe'))) return false;
-    return true;
+  document.querySelectorAll(".look").forEach(card => {
+    const okF = fFormality === "all" || card.dataset.formality === fFormality;
+    const eff = effRating(card);
+    let okR = true;
+    if (fRating === "all") okR = true;
+    else if (fRating === "unrated") okR = !eff;
+    else okR = eff === fRating;
+    card.style.display = (okF && okR) ? "" : "none";
   });
-  const sort=F.sort.value;
-  if(sort==='name') view.sort((a,b)=>a.name.localeCompare(b.name));
-  else if(sort==='cat') view.sort((a,b)=>(a.cat||'').localeCompare(b.cat||'')||a.name.localeCompare(b.name));
-  document.getElementById('grid').innerHTML=view.map(cardHTML).join('');
-  document.getElementById('count').textContent=view.length+' / '+ITEMS.length+' pieces';
-}
-
-function opt(arr){ return ['<option value="">All</option>'].concat([...new Set(arr)].filter(Boolean).sort()
-  .map(v=>'<option>'+v+'</option>')).join(''); }
-const F={};
-function initFilters(){
-  ['q','cat','color','form','season','vibe','status','sort'].forEach(id=>F[id]=document.getElementById('f-'+id));
-  F.cat.innerHTML=opt(ITEMS.map(i=>i.cat));
-  F.color.innerHTML=opt(ITEMS.flatMap(i=>i.colors||[]));
-  F.form.innerHTML=opt(ITEMS.map(i=>i.form));
-  F.season.innerHTML=opt(ITEMS.flatMap(i=>i.season||[]));
-  F.vibe.innerHTML=opt(ITEMS.flatMap(i=>i.vibe||[]));
-  F.status.innerHTML=opt(ITEMS.map(i=>i.status));
-  Object.values(F).forEach(el=>el.addEventListener('input',applyFilters));
-  document.getElementById('f-clear').onclick=()=>{Object.values(F).forEach(el=>{if(el.tagName==='SELECT')el.value='';else el.value='';});applyFilters();};
-}
-
-function openDrawer(it){
-  const s=srcFor(it); const a=ann(it.id);
-  const row=(k,v)=> v&&v.length? '<div class="spec-row"><div class="k">'+k+'</div><div>'+(Array.isArray(v)?v.join(', '):v)+'</div></div>':'';
-  document.getElementById('dbody').innerHTML=
-    '<div class="dimg">'+(s?'<img src="'+s+'" alt="'+it.name+'" onerror="this.replaceWith(document.createTextNode(\''+(it.key||'')+'\'))">':(it.key||'no image key'))+'</div>'+
-    '<h2 class="serif">'+it.name+'</h2><div class="dbrand">'+(it.brand||'—')+'</div>'+
-    row('Category',it.cat)+row('Colour',it.colors)+row('Material',it.material)+row('Fit',it.fit)+
-    row('Formality',it.form)+row('Season',it.season)+row('Vibe',it.vibe)+row('Status',it.status)+row('Product',it.product)+
-    '<div class="spec-row"><div class="k">My take</div><div>'+
-      '<div class="rate">'+['Top','Solid','Maybe'].map(r=>'<button data-r="'+r+'" aria-pressed="'+(a.rating===r)+'">'+r+'</button>').join('')+'</div>'+
-      '<textarea class="note" placeholder="Personal note (saved on this device)">'+(a.note||'')+'</textarea>'+
-    '</div></div>';
-  document.querySelectorAll('.rate button').forEach(b=>b.onclick=()=>{
-    const cur=ann(it.id); cur.rating=(cur.rating===b.dataset.r?'':b.dataset.r); setAnn(it.id,cur);
-    document.querySelectorAll('.rate button').forEach(x=>x.setAttribute('aria-pressed', x.dataset.r===cur.rating));
-    applyFilters();
+  document.querySelectorAll(".capsule").forEach(sec => {
+    const any = [...sec.querySelectorAll(".look")].some(c => c.style.display !== "none");
+    sec.querySelectorAll(".group-label").forEach(g => {
+      let n = g.nextElementSibling, vis = false;
+      while (n && !n.classList.contains("group-label") && !n.classList.contains("pack")){
+        if (n.classList.contains("look") && n.style.display !== "none") vis = true;
+        n = n.nextElementSibling;
+      }
+      g.style.display = vis ? "" : "none";
+    });
   });
-  document.querySelector('.note').oninput=e=>{const cur=ann(it.id);cur.note=e.target.value;setAnn(it.id,cur);};
-  document.getElementById('scrim').classList.add('on');
-  document.getElementById('drawer').classList.add('on');
-}
-function closeDrawer(){document.getElementById('scrim').classList.remove('on');document.getElementById('drawer').classList.remove('on');}
-
-function renderRows(elId, rows, fmt, emptyTitle, emptyMsg){
-  const el=document.getElementById(elId);
-  if(!rows.length){ el.innerHTML='<div class="empty"><h3>'+emptyTitle+'</h3><p>'+emptyMsg+'</p></div>'; return; }
-  el.innerHTML='<div class="list">'+rows.map(fmt).join('')+'</div>';
 }
 
-function tab(name){
-  document.querySelectorAll('nav.tabs button').forEach(b=>b.setAttribute('aria-selected', b.dataset.t===name));
-  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on', p.id==='panel-'+name));
+function exportFeedback(){
+  const buckets = {top:[], solid:[], maybe:[], cut:[]};
+  const notes = [];
+  document.querySelectorAll(".look").forEach(card => {
+    const id = card.dataset.look;
+    const name = card.dataset.name;
+    const r = LS.getItem(rkey(id));
+    if (r && buckets[r]) buckets[r].push(name + "  [" + id + "]");
+    const n = LS.getItem(nkey(id));
+    if (n) notes.push("- " + name + ": " + n + "  [" + id + "]");
+  });
+  let out = "DRESSING ROOM — FEEDBACK\n\n";
+  const lab = {top:"TOP", solid:"SOLID", maybe:"MAYBE", cut:"CUT"};
+  for (const k of ["top","solid","maybe","cut"]){
+    out += lab[k] + " (" + buckets[k].length + ")\n";
+    out += (buckets[k].length ? buckets[k].map(x => "  " + x).join("\n") : "  \u2014") + "\n\n";
+  }
+  out += "NOTES\n" + (notes.length ? notes.join("\n") : "  \u2014") + "\n";
+  const ta = document.getElementById("exportText");
+  ta.value = out;
+  document.getElementById("exportModal").classList.add("show");
+  ta.select();
+}
+function copyExport(){
+  const ta = document.getElementById("exportText");
+  ta.select(); document.execCommand("copy");
+  const b = document.getElementById("copyBtn"); b.textContent = "Copied";
+  setTimeout(() => b.textContent = "Copy", 1400);
 }
 
-document.addEventListener('DOMContentLoaded',()=>{
-  initFilters(); applyFilters();
-  document.getElementById('grid').addEventListener('click',e=>{const c=e.target.closest('.card');if(c)openDrawer(view[+c.dataset.i]);});
-  document.getElementById('scrim').onclick=closeDrawer;
-  document.getElementById('dclose').onclick=closeDrawer;
-  document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer();});
-  document.querySelectorAll('nav.tabs button').forEach(b=>b.onclick=()=>tab(b.dataset.t));
+function paintPack(){
+  document.querySelectorAll(".pitem input").forEach(cb => {
+    const on = LS.getItem(pkey(cb.dataset.cap, cb.dataset.it)) === "1";
+    cb.checked = on; cb.closest(".pitem").classList.toggle("done", on);
+  });
+}
 
-  renderRows('panel-looks', DATA.looks, l=>'<div class="row"><div class="rt serif">'+l.name+'</div>'+
-    '<div class="rs">'+[l.form,(l.occasion||[]).join(' · '),l.status].filter(Boolean).join('  ·  ')+'</div>'+
-    (l.items&&l.items.length?'<div style="margin-top:8px;font-size:13.5px">'+l.items.join(' · ')+'</div>':'')+'</div>',
-    'No looks yet','Outfits live in Notion. Tell Claude “build looks from my closet” and they’ll appear here on the next build.');
-  renderRows('panel-capsules', DATA.capsules, c=>'<div class="row"><div class="rt serif">'+c.name+'</div>'+
-    '<div class="rs">'+(c.type||'')+'</div>'+(c.items&&c.items.length?'<div style="margin-top:8px;font-size:13.5px">'+c.items.join(' · ')+'</div>':'')+'</div>',
-    'No capsules yet','Create a trip, event, seasonal, or vibe capsule in Notion and it shows up here.');
-  renderRows('panel-want', DATA.recs, r=>'<div class="row"><div class="rt serif">'+r.name+(r.price?' — $'+r.price:'')+'</div>'+
-    '<div class="rs">'+[r.brand,r.status,r.priority].filter(Boolean).join('  ·  ')+'</div>'+
-    (r.rationale?'<div style="margin-top:8px;font-size:13.5px">'+r.rationale+'</div>':'')+
-    (r.link?'<div style="margin-top:8px"><a class="mono" style="font-size:11px" href="'+r.link+'" target="_blank">View →</a></div>':'')+'</div>',
-    'Nothing on the want list','Validated buys from Claude land here — confirmed link + price, the gap each one fills.');
-  renderRequests();
-  document.getElementById('req-add').onclick=addReq;
-  document.getElementById('req-copy').onclick=copyReqs;
-  document.getElementById('req-text').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlKey))addReq();});
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll(".look").forEach(paintLook);
+  document.querySelectorAll(".rbtn").forEach(b =>
+    b.addEventListener("click", () => setRating(b.closest(".look"), b.dataset.r)));
+  document.querySelectorAll(".ninput").forEach(n =>
+    n.addEventListener("input", () => {
+      const id = n.closest(".look").dataset.look;
+      if (n.value.trim()) LS.setItem(nkey(id), n.value); else LS.removeItem(nkey(id));
+    }));
+  document.querySelectorAll("[data-ff]").forEach(c =>
+    c.addEventListener("click", () => {
+      fFormality = c.dataset.ff;
+      document.querySelectorAll("[data-ff]").forEach(x => x.classList.toggle("on", x === c));
+      applyFilters();
+    }));
+  document.querySelectorAll("[data-fr]").forEach(c =>
+    c.addEventListener("click", () => {
+      fRating = c.dataset.fr;
+      document.querySelectorAll("[data-fr]").forEach(x => x.classList.toggle("on", x === c));
+      applyFilters();
+    }));
+  document.querySelectorAll(".pitem input").forEach(cb =>
+    cb.addEventListener("change", () => {
+      if (cb.checked) LS.setItem(pkey(cb.dataset.cap, cb.dataset.it), "1");
+      else LS.removeItem(pkey(cb.dataset.cap, cb.dataset.it));
+      cb.closest(".pitem").classList.toggle("done", cb.checked);
+    }));
+  document.getElementById("exportBtn").addEventListener("click", exportFeedback);
+  document.getElementById("copyBtn").addEventListener("click", copyExport);
+  document.getElementById("closeBtn").addEventListener("click",
+    () => document.getElementById("exportModal").classList.remove("show"));
+  paintPack(); applyFilters();
 });
-function reqAll(){try{return JSON.parse(localStorage.getItem('dr:requests'))||[]}catch(e){return[]}}
-function reqSave(a){localStorage.setItem('dr:requests',JSON.stringify(a));}
-function renderRequests(){
-  const a=reqAll(); const el=document.getElementById('req-list');
-  document.getElementById('req-count').textContent=a.length?(a.length+' open'):'';
-  if(!a.length){el.innerHTML='<div class="empty"><h3>No requests yet</h3><p>Jot any change — a styling tweak, a new look, a catalog fix. It saves here; tap “Copy for Claude” and paste it into chat to push an update.</p></div>';return;}
-  el.innerHTML='<div class="list">'+a.map((r,i)=>'<div class="row"><div style="display:flex;gap:10px;align-items:flex-start"><div style="flex:1">'+r.t.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'<div class="rs">'+new Date(r.ts).toLocaleDateString()+'</div></div><button class="reqx" data-i="'+i+'" aria-label="Delete request">×</button></div></div>').join('')+'</div>';
-  el.querySelectorAll('.reqx').forEach(b=>b.onclick=()=>{const x=reqAll();x.splice(+b.dataset.i,1);reqSave(x);renderRequests();});
-}
-function addReq(){const t=document.getElementById('req-text');const v=t.value.trim();if(!v)return;const a=reqAll();a.unshift({t:v,ts:Date.now()});reqSave(a);t.value='';renderRequests();}
-function copyReqs(){const a=reqAll();if(!a.length)return;const txt='The Dressing Room — requests:\n'+a.map((r,i)=>(i+1)+'. '+r.t).join('\n');
-  navigator.clipboard.writeText(txt).then(()=>{const b=document.getElementById('req-copy');const o=b.textContent;b.textContent='Copied ✓';setTimeout(()=>b.textContent=o,1400);});}
 """
 
-def shell(items, looks, capsules, recs, mode, imgmap):
-    data = {"items": items, "looks": looks, "capsules": capsules, "recs": recs}
-    return f"""<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>The Dressing Room</title>
-<meta name="theme-color" content="#E9E3D7">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="The Dressing Room">
-<link rel="manifest" href="manifest.webmanifest">
-<link rel="apple-touch-icon" href="icon-180.png">
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400&family=Inter:wght@400;500&family=Spline+Sans+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>{CSS}</style></head><body>
-<header class="top"><div class="bar">
-  <div><div class="brandmark">The Dressing Room</div><div class="eyebrow">A+R atelier inventory</div></div>
-  <nav class="tabs" role="tablist">
-    <button data-t="closet" aria-selected="true">Closet</button>
-    <button data-t="looks" aria-selected="false">Looks</button>
-    <button data-t="capsules" aria-selected="false">Capsules</button>
-    <button data-t="want" aria-selected="false">Want / Find</button>
-    <button data-t="requests" aria-selected="false">Requests</button>
-  </nav>
-</div></header>
-<div class="wrap">
-  <section id="panel-closet" class="panel on">
-    <div class="spec">
-      <input id="f-q" type="search" placeholder="Search name, brand, material, notes…" aria-label="Search">
-      <select id="f-cat" aria-label="Category"></select>
-      <select id="f-color" aria-label="Colour"></select>
-      <select id="f-form" aria-label="Formality"></select>
-      <select id="f-season" aria-label="Season"></select>
-      <select id="f-vibe" aria-label="Vibe"></select>
-      <select id="f-status" aria-label="Status"></select>
-      <select id="f-sort" aria-label="Sort"><option value="">By index</option><option value="name">By name</option><option value="cat">By category</option></select>
-      <button id="f-clear" class="clear">Clear</button>
-      <span id="count" class="count"></span>
-    </div>
-    <div id="grid" class="grid"></div>
-  </section>
-  <section id="panel-looks" class="panel"></section>
-  <section id="panel-capsules" class="panel"></section>
-  <section id="panel-want" class="panel"></section>
-  <section id="panel-requests" class="panel">
-    <div class="spec" style="gap:10px">
-      <textarea id="req-text" placeholder="Describe a change — “build 5 Lisbon dinner looks”, “make the cards larger”, “0556 is black not grey”…" style="flex:1 1 260px;border:1px solid var(--line);background:#fff;padding:9px 10px;border-radius:2px;font:inherit;min-height:46px;resize:vertical"></textarea>
-      <button id="req-add" class="reqbtn">Add</button>
-      <button id="req-copy" class="reqbtn alt">Copy for Claude</button>
-      <span id="req-count" class="count"></span>
-    </div>
-    <div id="req-list"></div>
-  </section>
-</div>
-<div id="scrim" class="scrim"></div>
-<aside id="drawer" class="drawer" role="dialog" aria-modal="true">
-  <button id="dclose" class="x" aria-label="Close">×</button><div id="dbody"></div>
-</aside>
-<script>const MODE={json.dumps(mode)};const IMG={json.dumps(imgmap)};const DATA={json.dumps(data)};</script>
-<script>{APP_JS}</script>
-</body></html>"""
 
-# ---------- preview ----------
-PREVIEW = [
-    ("IMG_0522","Navy Breton Stripe SS Tee","","Tee","Casual","Slim",["Navy","Stripe"],"","Riviera"),
-    ("IMG_0523","Tan Slub SS Tee","","Tee","Casual","Slim",["Tan"],"","Riviera"),
-    ("bylt_henley_navy","Navy BYLT Henley","BYLT","Tee","Casual","Slim",["Navy"],"","Riviera"),
-    ("IMG_0540","Tan Linen Shorts","","Shorts","Casual","Slim",["Tan"],"Linen","Riviera"),
-    ("IMG_0509-5","Rust 5-Pocket Trousers","","Trousers","Casual","Slim",["Rust"],"","Riviera"),
-    ("IMG_0515","Olive Trousers","","Trousers","Casual","Slim",["Olive"],"","Soft tailoring"),
-    ("IMG_0548","Marigold Sweater","","Knitwear","Casual","Slim",["Marigold"],"","Riviera"),
-    ("IMG_0605","Navy Soft Blazer","","Tailoring","Smart","Tailored",["Navy"],"","Soft tailoring"),
-    ("IMG_0619","Cognac Leather Boots","","Footwear","Smart","",["Brown"],"Leather","Heritage"),
-    ("IMG_0638","White On Cloud Sneakers","On","Footwear","Casual","",["White"],"","Sporty"),
-    ("belt_woven_tobacco","Nisolo Woven Tobacco Belt","Nisolo","Accessory","Casual","",["Brown"],"Woven leather","Riviera"),
-    ("IMG_0633","Watch — Cream Dial, Steel Bracelet","","Accessory","Dressy","",["Cream","Grey"],"","Heritage"),
-]
-def build_preview(thumbs):
-    items, imgmap = [], {}
-    for k,nm,br,cat,form,fit,cols,mat,vibe in PREVIEW:
-        items.append({"id":k,"name":nm,"brand":br,"cat":cat,"status":"Regular rotation","form":form,
-            "fit":fit,"colors":cols,"material":mat,"season":["SS"],"vibe":[vibe] if vibe else [],"notes":k,"key":k})
-        fp=os.path.join(thumbs,k+".jpg")
-        if os.path.exists(fp):
-            imgmap[k]="data:image/jpeg;base64,"+base64.b64encode(open(fp,"rb").read()).decode()
-    looks=[]; capsules=[]
-    recs=[{"name":"Bather — Sage Linen Camp Shirt","brand":"Bather","price":150,"link":"https://bather.com",
-           "rationale":"Camp collar in a quiet sage linen — riviera, not loud. Confirm stock at purchase.","status":"Watching","priority":"Med"}]
-    html=shell(items,looks,capsules,recs,"base64",imgmap)
-    open("/home/claude/wardrobe_preview.html","w").write(html)
-    print(f"preview written: {len(items)} items, {len(imgmap)} images embedded")
+def esc(s):
+    return html.escape(s or "")
+
+
+def tile(item):
+    if item and item.get("img"):
+        return '<div class="tile"><img src="%s" alt="%s" loading="lazy"></div>' % (
+            esc(item["img"]),
+            esc(item["name"]),
+        )
+    return '<div class="tile empty">%s</div>' % esc(item["name"] if item else "")
+
+
+def render_look(o, closet, num):
+    tops, bottoms, shoes, accs = [], [], [], []
+    for iid in o["items"]:
+        it = closet.get(iid)
+        if not it:
+            continue
+        s = slot_of(it["category"])
+        {"top": tops, "bottom": bottoms, "shoes": shoes, "acc": accs}[s].append(it)
+
+    strip = (tops + bottoms + shoes)[:6] or [None, None, None]
+    thumbs = "".join(tile(it) for it in strip)
+
+    slot_rows = []
+    for label, group in (("Top", tops), ("Bottom", bottoms), ("Shoes", shoes)):
+        if group:
+            slot_rows.append(
+                '<div class="slot"><div class="k">%s</div><div>%s</div></div>'
+                % (label, esc(" + ".join(i["name"] for i in group)))
+            )
+    slots_html = "".join(slot_rows)
+
+    note_html = '<div class="note">%s</div>' % esc(o["notes"]) if o["notes"] else ""
+
+    wear_html = ""
+    if accs:
+        rows = "".join(
+            '<div class="acc"><div class="athumb">%s</div><div>%s</div></div>'
+            % (
+                ('<img src="%s" alt="">' % esc(a["img"])) if a.get("img") else "",
+                esc(a["name"]),
+            )
+            for a in accs
+        )
+        wear_html = '<div class="wear"><div class="wl">Wear with</div>%s</div>' % rows
+
+    tag = FORMALITY_LABEL.get(o["formality"], o["formality"] or "")
+
+    return """
+<div class="look" data-look="%s" data-name="%s" data-formality="%s" data-rating="%s">
+  <div class="strip">%s</div>
+  <div class="body">
+    <div class="lhead"><span class="lnum">Look %02d</span><span class="ltag">%s</span></div>
+    <div class="lname serif">%s</div>
+    <div class="slots">%s</div>
+    %s%s
+    <div class="rate">
+      <button class="rbtn" data-r="top">Top</button>
+      <button class="rbtn" data-r="solid">Solid</button>
+      <button class="rbtn" data-r="maybe">Maybe</button>
+      <button class="rbtn" data-r="cut">Cut</button>
+      <input class="ninput" placeholder="note\u2026">
+    </div>
+  </div>
+</div>""" % (
+        esc(o["id"]),
+        esc(o["name"]),
+        esc(o["formality"] or ""),
+        esc((o["rating"] or "").lower()),
+        thumbs,
+        num,
+        esc(tag),
+        esc(o["name"]),
+        slots_html,
+        note_html,
+        wear_html,
+    )
+
+
+def render_pack(cap_id, cap, looks, closet):
+    # union of all items used across this capsule's looks, grouped by category
+    seen, by_cat = set(), {}
+    cat_order = [
+        "Shirt", "Polo", "Knitwear", "Tee", "Outerwear",
+        "Tailoring", "Trousers", "Shorts", "Footwear", "Swim", "Accessory",
+    ]
+    for o in looks:
+        for iid in o["items"]:
+            if iid in seen:
+                continue
+            it = closet.get(iid)
+            if not it:
+                continue
+            seen.add(iid)
+            by_cat.setdefault(it["category"] or "Other", []).append((iid, it))
+    if not seen:
+        return ""
+    blocks = []
+    for cat in cat_order + [c for c in by_cat if c not in cat_order]:
+        items = by_cat.get(cat)
+        if not items:
+            continue
+        rows = "".join(
+            '<div class="pitem"><input type="checkbox" data-cap="%s" data-it="%s" id="p_%s"><label for="p_%s">%s</label></div>'
+            % (esc(cap_id), esc(iid), esc(iid), esc(iid), esc(it["name"]))
+            for iid, it in sorted(items, key=lambda x: x[1]["name"].lower())
+        )
+        blocks.append('<div class="cat">%s</div>%s' % (esc(cat), rows))
+    return '<div class="pack"><h3>Packing list \u00b7 %s</h3>%s</div>' % (
+        esc(cap["name"]),
+        "".join(blocks),
+    )
+
+
+def build_html(closet, capsules, outfits):
+    # group outfits by capsule
+    by_cap = {}
+    for o in outfits:
+        by_cap.setdefault(o["capsule"], []).append(o)
+
+    total = len(outfits)
+    rated = sum(1 for o in outfits if o["rating"])
+
+    parts = []
+    cap_ids = [c for c in by_cap if c is not None]
+    cap_ids.sort(key=lambda c: (capsules.get(c, {}).get("start") or "", capsules.get(c, {}).get("name") or ""))
+    if None in by_cap:
+        cap_ids.append(None)
+
+    if not outfits:
+        parts.append('<div class="empty-state">No looks yet. Add looks in Notion and they\u2019ll appear here on the next rebuild.</div>')
+
+    for cap_id in cap_ids:
+        looks = by_cap[cap_id]
+        cap = capsules.get(cap_id, {"name": "Unsorted", "notes": "", "start": None})
+        meta_bits = []
+        if cap.get("start"):
+            meta_bits.append(esc(cap["start"]))
+        if cap.get("notes"):
+            meta_bits.append(esc(cap["notes"]))
+        cmeta = " \u00b7 ".join(meta_bits)
+        sec = ['<section class="capsule">',
+               '<h2 class="serif">%s</h2>' % esc(cap["name"])]
+        if cmeta:
+            sec.append('<p class="cmeta">%s</p>' % cmeta)
+
+        n = 0
+        for f in FORMALITY_ORDER:
+            flooks = [o for o in looks if o["formality"] == f]
+            if not flooks:
+                continue
+            sec.append('<div class="group-label">%s</div>' % esc(FORMALITY_LABEL[f]))
+            for o in flooks:
+                n += 1
+                sec.append(render_look(o, closet, n))
+        # looks with no/other formality
+        rest = [o for o in looks if o["formality"] not in FORMALITY_ORDER]
+        if rest:
+            sec.append('<div class="group-label">Other</div>')
+            for o in rest:
+                n += 1
+                sec.append(render_look(o, closet, n))
+
+        sec.append(render_pack(cap_id, cap, looks, closet))
+        sec.append("</section>")
+        parts.append("".join(sec))
+
+    formality_chips = '<button class="chip on" data-ff="all">All</button>' + "".join(
+        '<button class="chip" data-ff="%s">%s</button>' % (f, esc(FORMALITY_LABEL[f]))
+        for f in FORMALITY_ORDER
+    )
+    rating_chips = "".join(
+        '<button class="chip%s" data-fr="%s">%s</button>'
+        % (" on" if v == "all" else "", v, lbl)
+        for v, lbl in [
+            ("all", "All"), ("unrated", "Unrated"),
+            ("top", "Top"), ("solid", "Solid"), ("maybe", "Maybe"), ("cut", "Cut"),
+        ]
+    )
+
+    return """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Dressing Room</title>
+<style>%s</style>
+</head><body>
+<div class="wrap">
+  <header class="top">
+    <div class="eyebrow">Wardrobe OS</div>
+    <h1 class="serif">The Dressing Room</h1>
+    <p class="sub">Looks built in Notion. Rate, note, and cut here \u2014 the next rebuild reflects it.</p>
+    <div class="stats">
+      <div class="stat"><div class="n">%d</div><div class="l">Looks</div></div>
+      <div class="stat"><div class="n">%d</div><div class="l">Capsules</div></div>
+      <div class="stat"><div class="n">%d</div><div class="l">Rated</div></div>
+    </div>
+  </header>
+
+  <div class="filters">
+    <div class="frow"><span class="lbl">Vibe</span>%s
+      <button class="export" id="exportBtn">Export feedback</button></div>
+    <div class="frow"><span class="lbl">Rating</span>%s</div>
+  </div>
+
+  %s
+
+  <footer>Generated from Notion \u00b7 The Dressing Room</footer>
+</div>
+
+<div class="modal" id="exportModal"><div class="box">
+  <h3 class="serif">Export feedback</h3>
+  <p>Copy this and paste it back in chat. I\u2019ll apply your ratings in Notion and cut what you cut.</p>
+  <textarea id="exportText" readonly></textarea>
+  <div class="actions">
+    <button id="closeBtn">Close</button>
+    <button class="primary" id="copyBtn">Copy</button>
+  </div>
+</div></div>
+
+<script>%s</script>
+</body></html>""" % (
+        CSS,
+        total,
+        len([c for c in by_cap if c is not None]),
+        rated,
+        formality_chips,
+        rating_chips,
+        "\n".join(parts),
+        JS,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
 
 def main():
-    if "--preview" in sys.argv:
-        build_preview(sys.argv[sys.argv.index("--preview")+1]); return
-    if not requests: sys.exit("pip install requests")
-    if not TOKEN: sys.exit("Set NOTION_TOKEN.")
-    print("Querying Notion…")
-    items, looks, capsules, recs = load_from_notion()
-    html=shell(items,looks,capsules,recs,"path",{})
-    open("index.html","w").write(html)
-    print(f"index.html written — {len(items)} items, {len(looks)} looks, {len(capsules)} capsules, {len(recs)} recs.")
-    print("Drop your finished photos in an images/ folder beside it, using the exact filenames attached in Notion (e.g. IMG_0509-5.jpg, sunglasses_rayban_grey.png).")
+    if not NOTION_TOKEN:
+        raise SystemExit(
+            "NOTION_TOKEN is not set. In CI, set it as a secret and pass it to the step:\n"
+            "  env:\n    NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}"
+        )
+    t0 = time.time()
+    closet, capsules, outfits = load()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    html_out = build_html(closet, capsules, outfits)
+    (OUT_DIR / "index.html").write_text(html_out, encoding="utf-8")
+    print(
+        "Wrote %s  (%d looks, %d items, %d capsules)  in %.1fs"
+        % (OUT_DIR / "index.html", len(outfits), len(closet), len(capsules), time.time() - t0)
+    )
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
