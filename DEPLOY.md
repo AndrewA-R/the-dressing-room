@@ -1,33 +1,30 @@
-# The Dressing Room — deploy (free, no domain)
+# The Dressing Room — app (deploy via Cowork)
 
-This whole folder *is* the site. Pick one host below — both are free and give a URL
-that works on the iPad (Safari → Share → **Add to Home Screen** installs it like an app).
+This replaces the old static GitHub Pages site. It's a Vite + React front end with three
+Vercel serverless functions that read and write Andrew's Notion live. There is no more
+hourly rebuild — the app reflects Notion in real time.
 
-## Option A — GitHub Pages
-1. Free account at github.com.
-2. New repository, e.g. `dressing-room`, Public.
-3. Add file → Upload files → drag in everything here (index.html, manifest.webmanifest,
-   the icon-*.png files, and the images/ folder). Commit.
-4. Settings → Pages → Source: Deploy from a branch → `main` / root → Save.
-5. URL appears in ~1 min: https://USERNAME.github.io/dressing-room/
+## What to do
+1. Put the contents of this folder into the GitHub repo connected to Andrew's Vercel project
+   (replace the previous static-site files — `build_dashboard.py`, `index.html`, `images/`,
+   the old `rebuild.yml` are all obsolete and can be removed).
+2. Confirm these env vars exist in the Vercel project (Settings → Environment Variables),
+   for Production:
+   - `NOTION_TOKEN` — the existing `ntn_…` integration secret.
+   - `ANTHROPIC_API_KEY` — for the "Build a look" generate feature.
+3. Vercel auto-detects Vite. No build config needed: build command `vite build`, output `dist`,
+   functions in `/api` run on the Node runtime automatically.
+4. Deploy. Send Andrew the live URL.
 
-## Option B — Cloudflare Pages
-pages.cloudflare.com → Create project → Upload assets → drag this folder in →
-get a https://PROJECT.pages.dev URL.
+## Notes
+- The Notion integration must have access to all five databases (Closet, Outfits, Capsules,
+  Recommendations, Inspiration) — it already does from the previous setup.
+- Photos are served from Notion's own (short-lived) signed URLs; because the app fetches live
+  on each load, they stay fresh. No local image folder needed.
+- `delete` archives a look to Notion's trash (recoverable) — it is never a hard delete.
 
-## On the iPad
-Open the URL in Safari → Share → Add to Home Screen. Launches full-screen, hanger icon.
-
-## Updating (no downloads for you)
-When I improve styling or your catalog, I hand you a new `index.html` (and any changed
-images). Overwrite the file(s) in the repo and refresh the page. Requests you log in the
-**Requests** tab → tap *Copy for Claude* → paste into chat, and I push the update.
-
-## Full resolution
-images/ ships with 600px working photos so it looks right immediately. For full-res,
-drop your finished-folder JPEGs into images/ using the same filenames
-(IMG_0523.jpg, bylt_henley_navy.jpg, …) and re-upload.
-
-## Let Cowork do it
-Cowork can create the repo, push this folder, enable Pages, and push every future
-update — point it here and at your GitHub login.
+## Local check (optional)
+```
+npm install
+npm run build      # confirms the front end compiles
+```
